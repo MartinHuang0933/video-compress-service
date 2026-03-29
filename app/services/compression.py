@@ -1,0 +1,223 @@
+import asyncio
+import json
+import logging
+import os
+
+import httpx
+
+from app.config import settings
+from app.models.job import CompressOptions, CompressResult, Job, JobStatus
+from app.services import queue
+from app.services.storage import upload_to_ragic, upload_to_s3_presigned
+
+logger = logging.getLogger(__name__)
+
+QUALITY_PRESETS = {
+    "low": (28, 1280, "96k"),
+    "medium": (23, 1920, "128k"),
+    "high": (18, None, "192k"),
+}
+
+WEBHOOK_RETRY_DELAYS = [10, 30, 90, 270, 810]
+
+
+async def _probe(file_path: str) -> dict:
+    """Get video metadata using ffprobe."""
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        file_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    return json.loads(stdout.decode())
+
+
+def _build_ffmpeg_args(
+    input_path: str,
+    output_path: str,
+    options: CompressOptions,
+) -> list[str]:
+    """Build ffmpeg command arguments."""
+    preset = QUALITY_PRESETS.get(options.quality, QUALITY_PRESETS["medium"])
+    crf, max_width, audio_bitrate = preset
+
+    if options.max_width:
+        max_width = options.max_width
+
+    args = [
+        "ffmpeg",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", "medium",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        "-y",
+    ]
+
+    if max_width:
+        args += ["-vf", f"scale='min({max_width},iw)':-2"]
+
+    args.append(output_path)
+    return args
+
+
+async def _download_file(url: str, dest_path: str) -> int:
+    """Download a file using streaming. Returns file size in bytes."""
+    max_size = settings.max_file_size_mb * 1024 * 1024
+    total_size = 0
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with open(dest_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=8 * 1024 * 1024):
+                    total_size += len(chunk)
+                    if total_size > max_size:
+                        raise ValueError(
+                            f"File too large: >{settings.max_file_size_mb}MB"
+                        )
+                    f.write(chunk)
+    return total_size
+
+
+async def _send_webhook(webhook_url: str, job: Job) -> None:
+    """Send job result to webhook URL with 5 retries."""
+    payload = {
+        "job_id": job.job_id,
+        "status": job.status.value,
+        "result": job.result.model_dump() if job.result else None,
+        "error": job.error,
+        "metadata": job.metadata,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(5):
+            try:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+                logger.info(f"[{job.job_id}] Webhook sent successfully")
+                return
+            except Exception as e:
+                logger.warning(
+                    f"[{job.job_id}] Webhook attempt {attempt + 1}/5 failed: {e}"
+                )
+                if attempt < 4:
+                    await asyncio.sleep(WEBHOOK_RETRY_DELAYS[attempt])
+    logger.error(f"[{job.job_id}] Webhook failed after 5 attempts")
+
+
+async def process_job(job: Job) -> None:
+    """Main compression pipeline: download → probe → compress → upload → notify."""
+    semaphore = queue.get_semaphore()
+
+    async with semaphore:
+        temp_dir = settings.temp_dir
+        os.makedirs(temp_dir, exist_ok=True)
+
+        job_id = job.job_id
+        input_path = os.path.join(temp_dir, f"{job_id}_input.mp4")
+        output_path = os.path.join(temp_dir, f"{job_id}_output.mp4")
+
+        try:
+            # Step 1: Download
+            queue.update_job_status(job_id, JobStatus.downloading)
+            logger.info(f"[{job_id}] Downloading from {job.source_url}")
+            original_size = await _download_file(job.source_url, input_path)
+
+            # Step 2: Probe
+            probe_data = await _probe(input_path)
+            duration = float(probe_data.get("format", {}).get("duration", 0))
+            video_stream = next(
+                (s for s in probe_data.get("streams", []) if s["codec_type"] == "video"),
+                None,
+            )
+            resolution = (
+                f"{video_stream['width']}x{video_stream['height']}"
+                if video_stream
+                else None
+            )
+
+            # Step 3: Compress
+            queue.update_job_status(job_id, JobStatus.compressing)
+            ffmpeg_args = _build_ffmpeg_args(input_path, output_path, job.options)
+            logger.info(f"[{job_id}] Compressing: {' '.join(ffmpeg_args)}")
+
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed: {stderr.decode()[-500:]}")
+
+            compressed_size = os.path.getsize(output_path)
+
+            # Step 4: Upload
+            queue.update_job_status(job_id, JobStatus.uploading)
+
+            compressed_s3_url = None
+            ragic_url = None
+            ragic_error = None
+
+            # 4a: Upload to S3 via presigned URL
+            if job.manus_upload_url:
+                await upload_to_s3_presigned(job.manus_upload_url, output_path)
+                compressed_s3_url = job.manus_upload_url.split("?")[0]
+
+            # 4b: Upload to Ragic (failure doesn't break the job)
+            if job.ragic_config:
+                try:
+                    ragic_url = await upload_to_ragic(
+                        file_path=output_path,
+                        api_url=job.ragic_config.api_url,
+                        api_key=job.ragic_config.api_key,
+                        form_path=job.ragic_config.form_path,
+                        record_id=job.ragic_config.record_id,
+                        field_id=job.ragic_config.field_id,
+                    )
+                except Exception as e:
+                    logger.error(f"[{job_id}] Ragic upload failed: {e}")
+                    ragic_error = str(e)
+
+            # Step 5: Complete
+            result = CompressResult(
+                compressed_s3_url=compressed_s3_url,
+                ragic_url=ragic_url if ragic_url else None,
+                ragic_error=ragic_error,
+                original_size_mb=round(original_size / (1024 * 1024), 2),
+                compressed_size_mb=round(compressed_size / (1024 * 1024), 2),
+                compression_ratio=(
+                    round(compressed_size / original_size, 4) if original_size else 0
+                ),
+                duration_seconds=round(duration, 2) if duration else None,
+                resolution=resolution,
+            )
+            queue.update_job_status(job_id, JobStatus.completed, result=result)
+            logger.info(
+                f"[{job_id}] Done: {result.original_size_mb}MB → "
+                f"{result.compressed_size_mb}MB ({result.compression_ratio:.0%})"
+            )
+
+            # Step 6: Webhook
+            if job.webhook_url:
+                updated_job = queue.get_job(job_id)
+                await _send_webhook(job.webhook_url, updated_job)
+
+        except Exception as e:
+            logger.error(f"[{job_id}] Failed: {e}")
+            queue.update_job_status(job_id, JobStatus.failed, error=str(e))
+            if job.webhook_url:
+                updated_job = queue.get_job(job_id)
+                await _send_webhook(job.webhook_url, updated_job)
+        finally:
+            for path in (input_path, output_path):
+                if os.path.exists(path):
+                    os.remove(path)
