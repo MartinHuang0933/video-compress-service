@@ -31,14 +31,13 @@ class RagicConfig(BaseModel):
 class CompressRequest(BaseModel):
     source_url: str
     webhook_url: Optional[str] = None
-    manus_upload_url: Optional[str] = None
     options: CompressOptions = CompressOptions()
     ragic_config: Optional[RagicConfig] = None
     metadata: Optional[dict] = None
 
 
 class CompressResult(BaseModel):
-    compressed_s3_url: Optional[str] = None
+    download_url: str
     ragic_url: Optional[str] = None
     ragic_error: Optional[str] = None
     original_size_mb: float
@@ -53,12 +52,13 @@ class Job(BaseModel):
     status: JobStatus = JobStatus.queued
     source_url: str
     webhook_url: Optional[str] = None
-    manus_upload_url: Optional[str] = None
     options: CompressOptions = CompressOptions()
     ragic_config: Optional[RagicConfig] = None
     metadata: Optional[dict] = None
     result: Optional[CompressResult] = None
     error: Optional[str] = None
+    output_path: Optional[str] = None
+    output_expires_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
 

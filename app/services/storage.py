@@ -6,21 +6,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-async def upload_to_s3_presigned(presigned_url: str, file_path: str) -> None:
-    """Upload a file to S3 using a presigned PUT URL."""
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
-
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.put(
-            presigned_url,
-            content=file_bytes,
-            headers={"Content-Type": "video/mp4"},
-        )
-        resp.raise_for_status()
-    logger.info(f"Uploaded to S3 presigned URL ({len(file_bytes)} bytes)")
-
-
 async def upload_to_ragic(
     file_path: str,
     api_url: str,

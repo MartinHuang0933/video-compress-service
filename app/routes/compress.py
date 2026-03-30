@@ -1,7 +1,9 @@
 import asyncio
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.middleware.auth import verify_api_key
 from app.models.job import (
@@ -29,7 +31,6 @@ async def submit_compress_job(
         job_id=str(uuid.uuid4()),
         source_url=req.source_url,
         webhook_url=req.webhook_url,
-        manus_upload_url=req.manus_upload_url,
         options=req.options,
         ragic_config=req.ragic_config,
         metadata=req.metadata,
@@ -54,4 +55,34 @@ async def get_job_status(
         error=job.error,
         created_at=job.created_at,
         completed_at=job.completed_at,
+    )
+
+
+@router.get("/api/v1/jobs/{job_id}/download")
+async def download_compressed_file(
+    job_id: str,
+    _: str = Depends(verify_api_key),
+):
+    job = queue.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.completed:
+        raise HTTPException(status_code=400, detail="Job not completed")
+    if not job.output_path or not os.path.exists(job.output_path):
+        raise HTTPException(status_code=410, detail="File expired and has been cleaned up")
+
+    file_size = os.path.getsize(job.output_path)
+
+    def iter_file():
+        with open(job.output_path, "rb") as f:
+            while chunk := f.read(8 * 1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="compressed_{job_id}.mp4"',
+            "Content-Length": str(file_size),
+        },
     )

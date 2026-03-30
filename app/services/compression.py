@@ -2,13 +2,14 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from app.config import settings
 from app.models.job import CompressOptions, CompressResult, Job, JobStatus
 from app.services import queue
-from app.services.storage import upload_to_ragic, upload_to_s3_presigned
+from app.services.storage import upload_to_ragic
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ async def _send_webhook(webhook_url: str, job: Job) -> None:
 
 
 async def process_job(job: Job) -> None:
-    """Main compression pipeline: download → probe → compress → upload → notify."""
+    """Main compression pipeline: download → probe → compress → upload ragic → notify."""
     semaphore = queue.get_semaphore()
 
     async with semaphore:
@@ -160,19 +161,11 @@ async def process_job(job: Job) -> None:
 
             compressed_size = os.path.getsize(output_path)
 
-            # Step 4: Upload
+            # Step 4: Upload to Ragic (if configured; failure doesn't break the job)
             queue.update_job_status(job_id, JobStatus.uploading)
-
-            compressed_s3_url = None
             ragic_url = None
             ragic_error = None
 
-            # 4a: Upload to S3 via presigned URL
-            if job.manus_upload_url:
-                await upload_to_s3_presigned(job.manus_upload_url, output_path)
-                compressed_s3_url = job.manus_upload_url.split("?")[0]
-
-            # 4b: Upload to Ragic (failure doesn't break the job)
             if job.ragic_config:
                 try:
                     ragic_url = await upload_to_ragic(
@@ -187,9 +180,19 @@ async def process_job(job: Job) -> None:
                     logger.error(f"[{job_id}] Ragic upload failed: {e}")
                     ragic_error = str(e)
 
-            # Step 5: Complete
+            # Step 5: Complete — keep output file for download
+            download_url = (
+                f"{settings.base_url.rstrip('/')}/api/v1/jobs/{job_id}/download"
+                if settings.base_url
+                else f"/api/v1/jobs/{job_id}/download"
+            )
+
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=settings.file_retention_minutes
+            )
+
             result = CompressResult(
-                compressed_s3_url=compressed_s3_url,
+                download_url=download_url,
                 ragic_url=ragic_url if ragic_url else None,
                 ragic_error=ragic_error,
                 original_size_mb=round(original_size / (1024 * 1024), 2),
@@ -200,7 +203,14 @@ async def process_job(job: Job) -> None:
                 duration_seconds=round(duration, 2) if duration else None,
                 resolution=resolution,
             )
+
             queue.update_job_status(job_id, JobStatus.completed, result=result)
+
+            # Save output file info for download endpoint
+            updated_job = queue.get_job(job_id)
+            updated_job.output_path = output_path
+            updated_job.output_expires_at = expires_at
+
             logger.info(
                 f"[{job_id}] Done: {result.original_size_mb}MB → "
                 f"{result.compressed_size_mb}MB ({result.compression_ratio:.0%})"
@@ -208,16 +218,18 @@ async def process_job(job: Job) -> None:
 
             # Step 6: Webhook
             if job.webhook_url:
-                updated_job = queue.get_job(job_id)
                 await _send_webhook(job.webhook_url, updated_job)
 
         except Exception as e:
             logger.error(f"[{job_id}] Failed: {e}")
             queue.update_job_status(job_id, JobStatus.failed, error=str(e))
             if job.webhook_url:
-                updated_job = queue.get_job(job_id)
-                await _send_webhook(job.webhook_url, updated_job)
+                failed_job = queue.get_job(job_id)
+                await _send_webhook(job.webhook_url, failed_job)
+            # On failure, clean up output file
+            if os.path.exists(output_path):
+                os.remove(output_path)
         finally:
-            for path in (input_path, output_path):
-                if os.path.exists(path):
-                    os.remove(path)
+            # Always clean up input file; output is kept for download
+            if os.path.exists(input_path):
+                os.remove(input_path)
