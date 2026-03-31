@@ -30,6 +30,7 @@ async def submit_compress_job(
     job = Job(
         job_id=str(uuid.uuid4()),
         source_url=req.source_url,
+        source_urls=req.source_urls,
         webhook_url=req.webhook_url,
         options=req.options,
         ragic_config=req.ragic_config,

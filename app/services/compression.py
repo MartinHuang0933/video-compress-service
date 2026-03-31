@@ -88,6 +88,47 @@ async def _download_file(url: str, dest_path: str) -> int:
     return total_size
 
 
+async def _download_and_assemble_chunks(
+    urls: list[str], dest_path: str, job_id: str
+) -> int:
+    """依序下載多個 chunk URL，串流寫入同一檔案。回傳總位元組數。"""
+    max_size = settings.max_file_size_mb * 1024 * 1024
+    total_size = 0
+
+    with open(dest_path, "wb") as f:
+        for idx, url in enumerate(urls, start=1):
+            logger.info(
+                f"[{job_id}] Downloading chunk {idx}/{len(urls)}"
+            )
+            chunk_bytes = 0
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=300
+            ) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for data in response.aiter_bytes(
+                        chunk_size=8 * 1024 * 1024
+                    ):
+                        total_size += len(data)
+                        chunk_bytes += len(data)
+                        if total_size > max_size:
+                            raise ValueError(
+                                f"File too large: >{settings.max_file_size_mb}MB"
+                            )
+                        f.write(data)
+            logger.info(
+                f"[{job_id}] Chunk {idx}/{len(urls)} done: "
+                f"{round(chunk_bytes / (1024 * 1024), 2)}MB "
+                f"(total so far: {round(total_size / (1024 * 1024), 2)}MB)"
+            )
+
+    logger.info(
+        f"[{job_id}] All {len(urls)} chunks assembled: "
+        f"{round(total_size / (1024 * 1024), 2)}MB"
+    )
+    return total_size
+
+
 async def _send_webhook(webhook_url: str, job: Job) -> None:
     """Send job result to webhook URL with 5 retries."""
     payload = {
@@ -128,8 +169,18 @@ async def process_job(job: Job) -> None:
         try:
             # Step 1: Download
             queue.update_job_status(job_id, JobStatus.downloading)
-            logger.info(f"[{job_id}] Downloading from {job.source_url}")
-            original_size = await _download_file(job.source_url, input_path)
+            if job.source_urls:
+                logger.info(
+                    f"[{job_id}] Downloading {len(job.source_urls)} chunks"
+                )
+                original_size = await _download_and_assemble_chunks(
+                    job.source_urls, input_path, job_id
+                )
+                queue.update_job_status(job_id, JobStatus.assembling)
+                logger.info(f"[{job_id}] Chunks assembled successfully")
+            else:
+                logger.info(f"[{job_id}] Downloading from {job.source_url}")
+                original_size = await _download_file(job.source_url, input_path)
 
             # Step 2: Probe
             probe_data = await _probe(input_path)

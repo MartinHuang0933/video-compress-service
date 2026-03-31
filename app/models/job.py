@@ -2,12 +2,13 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class JobStatus(str, Enum):
     queued = "queued"
     downloading = "downloading"
+    assembling = "assembling"
     compressing = "compressing"
     uploading = "uploading"
     completed = "completed"
@@ -29,11 +30,22 @@ class RagicConfig(BaseModel):
 
 
 class CompressRequest(BaseModel):
-    source_url: str
+    source_url: Optional[str] = None
+    source_urls: Optional[list[str]] = None
     webhook_url: Optional[str] = None
     options: CompressOptions = CompressOptions()
     ragic_config: Optional[RagicConfig] = None
     metadata: Optional[dict] = None
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if self.source_url and self.source_urls:
+            raise ValueError("不可同時提供 source_url 和 source_urls，請擇一使用")
+        if not self.source_url and not self.source_urls:
+            raise ValueError("必須提供 source_url 或 source_urls 其中一個")
+        if self.source_urls is not None and len(self.source_urls) == 0:
+            raise ValueError("source_urls 不可為空陣列")
+        return self
 
 
 class CompressResult(BaseModel):
@@ -50,7 +62,8 @@ class CompressResult(BaseModel):
 class Job(BaseModel):
     job_id: str
     status: JobStatus = JobStatus.queued
-    source_url: str
+    source_url: Optional[str] = None
+    source_urls: Optional[list[str]] = None
     webhook_url: Optional[str] = None
     options: CompressOptions = CompressOptions()
     ragic_config: Optional[RagicConfig] = None
