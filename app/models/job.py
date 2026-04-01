@@ -72,6 +72,9 @@ class Job(BaseModel):
     error: Optional[str] = None
     output_path: Optional[str] = None
     output_expires_at: Optional[datetime] = None
+    original_url: Optional[str] = None
+    original_path: Optional[str] = None
+    original_expires_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
 
@@ -86,5 +89,6 @@ class JobStatusResponse(BaseModel):
     status: JobStatus
     result: Optional[CompressResult] = None
     error: Optional[str] = None
+    original_url: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None

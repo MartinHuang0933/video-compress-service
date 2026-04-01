@@ -54,6 +54,7 @@ async def get_job_status(
         status=job.status,
         result=job.result,
         error=job.error,
+        original_url=job.original_url,
         created_at=job.created_at,
         completed_at=job.completed_at,
     )
@@ -84,6 +85,34 @@ async def download_compressed_file(
         media_type="video/mp4",
         headers={
             "Content-Disposition": f'attachment; filename="compressed_{job_id}.mp4"',
+            "Content-Length": str(file_size),
+        },
+    )
+
+
+@router.get("/api/v1/jobs/{job_id}/original")
+async def download_original_file(
+    job_id: str,
+    _: str = Depends(verify_api_key),
+):
+    job = queue.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.original_path or not os.path.exists(job.original_path):
+        raise HTTPException(status_code=410, detail="Original file expired or not available")
+
+    file_size = os.path.getsize(job.original_path)
+
+    def iter_file():
+        with open(job.original_path, "rb") as f:
+            while chunk := f.read(8 * 1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="original_{job_id}.mp4"',
             "Content-Length": str(file_size),
         },
     )

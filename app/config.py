@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 1000
     max_concurrent_jobs: int = 2
     temp_dir: str = "/tmp/video-compress"
-    file_retention_minutes: int = 60
+    file_retention_minutes: int = 360
 
     model_config = {"env_file": ".env"}
 

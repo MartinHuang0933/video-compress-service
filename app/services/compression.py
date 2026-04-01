@@ -19,7 +19,7 @@ QUALITY_PRESETS = {
     "high": (18, None, "192k"),
 }
 
-WEBHOOK_RETRY_DELAYS = [10, 30, 90, 270, 810]
+WEBHOOK_RETRY_DELAYS = [5, 30, 120]
 
 
 async def _probe(file_path: str) -> dict:
@@ -130,28 +130,44 @@ async def _download_and_assemble_chunks(
 
 
 async def _send_webhook(webhook_url: str, job: Job) -> None:
-    """Send job result to webhook URL with 5 retries."""
+    """Send job result to webhook URL with retries (5s → 30s → 120s)."""
     payload = {
         "job_id": job.job_id,
         "status": job.status.value,
         "result": job.result.model_dump() if job.result else None,
         "error": job.error,
         "metadata": job.metadata,
+        "original_url": getattr(job, "original_url", None),
     }
+    max_attempts = len(WEBHOOK_RETRY_DELAYS) + 1
     async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(5):
+        for attempt in range(max_attempts):
             try:
                 resp = await client.post(webhook_url, json=payload)
                 resp.raise_for_status()
                 logger.info(f"[{job.job_id}] Webhook sent successfully")
                 return
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code < 500:
+                    logger.error(
+                        f"[{job.job_id}] Webhook failed with client error "
+                        f"{e.response.status_code}, not retrying"
+                    )
+                    return
+                logger.warning(
+                    f"[{job.job_id}] Webhook attempt {attempt + 1}/{max_attempts} "
+                    f"failed: {e}"
+                )
             except Exception as e:
                 logger.warning(
-                    f"[{job.job_id}] Webhook attempt {attempt + 1}/5 failed: {e}"
+                    f"[{job.job_id}] Webhook attempt {attempt + 1}/{max_attempts} "
+                    f"failed: {e}"
                 )
-                if attempt < 4:
-                    await asyncio.sleep(WEBHOOK_RETRY_DELAYS[attempt])
-    logger.error(f"[{job.job_id}] Webhook failed after 5 attempts")
+            if attempt < len(WEBHOOK_RETRY_DELAYS):
+                await asyncio.sleep(WEBHOOK_RETRY_DELAYS[attempt])
+    logger.error(
+        f"[{job.job_id}] webhook_delivery_failed after {max_attempts} attempts"
+    )
 
 
 async def process_job(job: Job) -> None:
@@ -181,6 +197,17 @@ async def process_job(job: Job) -> None:
             else:
                 logger.info(f"[{job_id}] Downloading from {job.source_url}")
                 original_size = await _download_file(job.source_url, input_path)
+
+            # Set original_url — keep input file as fallback
+            original_download_url = (
+                f"{settings.base_url.rstrip('/')}/api/v1/jobs/{job_id}/original"
+                if settings.base_url
+                else f"/api/v1/jobs/{job_id}/original"
+            )
+            job.original_url = original_download_url
+            job.original_path = input_path
+            job.original_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+            logger.info(f"[{job_id}] Original file available at {original_download_url}")
 
             # Step 2: Probe
             probe_data = await _probe(input_path)
@@ -281,6 +308,7 @@ async def process_job(job: Job) -> None:
             if os.path.exists(output_path):
                 os.remove(output_path)
         finally:
-            # Always clean up input file; output is kept for download
-            if os.path.exists(input_path):
+            # Only clean up input file if original_url was NOT set
+            # (original file is kept for 24h as fallback)
+            if not job.original_url and os.path.exists(input_path):
                 os.remove(input_path)
