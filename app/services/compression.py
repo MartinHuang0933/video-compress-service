@@ -9,7 +9,7 @@ import httpx
 from app.config import settings
 from app.models.job import CompressOptions, CompressResult, Job, JobStatus
 from app.services import queue
-from app.services.storage import upload_to_ragic
+from app.services.storage import upload_to_forge, upload_to_ragic
 
 logger = logging.getLogger(__name__)
 
@@ -222,22 +222,34 @@ async def process_job(job: Job) -> None:
                 else None
             )
 
-            # Step 3: Compress
-            queue.update_job_status(job_id, JobStatus.compressing)
-            ffmpeg_args = _build_ffmpeg_args(input_path, output_path, job.options)
-            logger.info(f"[{job_id}] Compressing: {' '.join(ffmpeg_args)}")
+            # Step 3: Compress (or skip)
+            should_compress = True
+            if job.skip_compress is not None:
+                should_compress = not job.skip_compress
+            elif settings.skip_compression:
+                should_compress = False
 
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
+            if should_compress:
+                queue.update_job_status(job_id, JobStatus.compressing)
+                ffmpeg_args = _build_ffmpeg_args(input_path, output_path, job.options)
+                logger.info(f"[{job_id}] Compressing: {' '.join(ffmpeg_args)}")
 
-            if process.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed: {stderr.decode()[-500:]}")
+                process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await process.communicate()
 
-            compressed_size = os.path.getsize(output_path)
+                if process.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed: {stderr.decode()[-500:]}")
+
+                compressed_size = os.path.getsize(output_path)
+                final_path = output_path
+            else:
+                logger.info(f"[{job_id}] Skipping compression (skip_compress=True)")
+                compressed_size = original_size
+                final_path = input_path
 
             # Step 4: Upload to Ragic (if configured; failure doesn't break the job)
             queue.update_job_status(job_id, JobStatus.uploading)
@@ -247,7 +259,7 @@ async def process_job(job: Job) -> None:
             if job.ragic_config:
                 try:
                     ragic_url = await upload_to_ragic(
-                        file_path=output_path,
+                        file_path=final_path,
                         api_url=job.ragic_config.api_url,
                         api_key=job.ragic_config.api_key,
                         form_path=job.ragic_config.form_path,
@@ -257,6 +269,23 @@ async def process_job(job: Job) -> None:
                 except Exception as e:
                     logger.error(f"[{job_id}] Ragic upload failed: {e}")
                     ragic_error = str(e)
+
+            # Step 4.5: Upload to Forge S3 (if configured; failure doesn't break the job)
+            forge_url = None
+            forge_error = None
+
+            if job.forge_config:
+                try:
+                    forge_url = await upload_to_forge(
+                        file_path=final_path,
+                        api_url=job.forge_config.api_url,
+                        api_key=job.forge_config.api_key,
+                        upload_path=job.forge_config.upload_path,
+                    )
+                    logger.info(f"[{job_id}] Uploaded to Forge S3: {forge_url[:80]}...")
+                except Exception as e:
+                    logger.error(f"[{job_id}] Forge upload failed: {e}")
+                    forge_error = str(e)
 
             # Step 5: Complete — keep output file for download
             download_url = (
@@ -271,8 +300,10 @@ async def process_job(job: Job) -> None:
 
             result = CompressResult(
                 download_url=download_url,
+                forge_url=forge_url,
                 ragic_url=ragic_url if ragic_url else None,
                 ragic_error=ragic_error,
+                forge_error=forge_error,
                 original_size_mb=round(original_size / (1024 * 1024), 2),
                 compressed_size_mb=round(compressed_size / (1024 * 1024), 2),
                 compression_ratio=(
@@ -286,7 +317,7 @@ async def process_job(job: Job) -> None:
 
             # Save output file info for download endpoint
             updated_job = queue.get_job(job_id)
-            updated_job.output_path = output_path
+            updated_job.output_path = final_path
             updated_job.output_expires_at = expires_at
 
             logger.info(
@@ -304,8 +335,8 @@ async def process_job(job: Job) -> None:
             if job.webhook_url:
                 failed_job = queue.get_job(job_id)
                 await _send_webhook(job.webhook_url, failed_job)
-            # On failure, clean up output file
-            if os.path.exists(output_path):
+            # On failure, clean up output file (but not if same as input)
+            if output_path != input_path and os.path.exists(output_path):
                 os.remove(output_path)
         finally:
             # Only clean up input file if original_url was NOT set

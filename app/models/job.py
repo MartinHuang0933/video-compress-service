@@ -29,12 +29,21 @@ class RagicConfig(BaseModel):
     field_id: str
 
 
+class ForgeConfig(BaseModel):
+    """Forge S3 儲存設定 — 由呼叫方 (Manus) 傳入"""
+    api_url: str
+    api_key: str
+    upload_path: str
+
+
 class CompressRequest(BaseModel):
     source_url: Optional[str] = None
     source_urls: Optional[list[str]] = None
     webhook_url: Optional[str] = None
     options: CompressOptions = CompressOptions()
     ragic_config: Optional[RagicConfig] = None
+    forge_config: Optional[ForgeConfig] = None
+    skip_compress: Optional[bool] = None
     metadata: Optional[dict] = None
 
     @model_validator(mode="after")
@@ -52,6 +61,8 @@ class CompressResult(BaseModel):
     download_url: str
     ragic_url: Optional[str] = None
     ragic_error: Optional[str] = None
+    forge_url: Optional[str] = None
+    forge_error: Optional[str] = None
     original_size_mb: float
     compressed_size_mb: float
     compression_ratio: float
@@ -75,6 +86,8 @@ class Job(BaseModel):
     original_url: Optional[str] = None
     original_path: Optional[str] = None
     original_expires_at: Optional[datetime] = None
+    forge_config: Optional[ForgeConfig] = None
+    skip_compress: Optional[bool] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
 

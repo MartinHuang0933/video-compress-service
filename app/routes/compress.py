@@ -34,6 +34,8 @@ async def submit_compress_job(
         webhook_url=req.webhook_url,
         options=req.options,
         ragic_config=req.ragic_config,
+        forge_config=req.forge_config,
+        skip_compress=req.skip_compress,
         metadata=req.metadata,
     )
     queue.create_job(job)
